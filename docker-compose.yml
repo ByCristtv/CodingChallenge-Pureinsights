@@ -1,0 +1,51 @@
+version: "3.9"
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: challenge-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: challenge-kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+
+  processor:
+    build:
+      context: ./processor
+      dockerfile: Dockerfile
+    container_name: challenge-processor
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - INPUT_DIR=/app/data
+      - INDEX_NAME=documents
+      - EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+    volumes:
+      - ./data/books:/app/data:ro
+      - ./processor/src:/app/src
+    working_dir: /app
+    command: ["python", "src/app.py"]
+
+volumes:
+  es_data:
