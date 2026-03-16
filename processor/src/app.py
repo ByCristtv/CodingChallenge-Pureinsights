@@ -2,7 +2,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Generator
 
 from elasticsearch import Elasticsearch, helpers
 from sentence_splitter import SentenceSplitter
@@ -12,6 +12,7 @@ ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://elasticsearch:9200")
 INPUT_DIR = os.getenv("INPUT_DIR", "/app/input")
 INDEX_NAME = os.getenv("INDEX_NAME", "documents")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 100))
 
 # Simple sentence embeddings model
 model = SentenceTransformer(EMBEDDING_MODEL)
@@ -74,56 +75,49 @@ def generate_embedding(text: str) -> List[float]:
     embedding = model.encode(text)
     return embedding.tolist()
 
-def process_documents(document: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # TODO: Complete the required code to process each document:
-    # Split the document into chunks (X)
-    # Generate an embedding for each chunk
-    # Add the embeddings to a new document along with the remaining fields
-    # Filter and replace non-ASCII characters
-    # Ensure that subjects are capitalized
-    doc_id = document.get("id")
-    title = document.get("title", "")
-    description = document.get("description", "")
-    subjects = document.get("subjects", [])
-
-    if not doc_id or not description:
-        return []
-    clean_description = re.sub(r'[^\x00-\x7F]+', ' ', description)
-    clean_subjects = [str(s).upper() for s in subjects]
-    chunks = split_into_chunks(clean_description)
-    result = []
-
-    for idx, chunk in enumerate(chunks):
-        embedding = generate_embedding(chunk)
-        result.append({
-            "doc_id": str(doc_id),
-            "chunk_id": f"{doc_id}-{idx}",
-            "title": title,
-            "description": chunk,
-            "embedding": embedding,
-            "subjects": clean_subjects
-        })
-
-    return result
-
-def index_documents(es: Elasticsearch, index_name: str, docs: List[Dict[str, Any]]) -> None:
-    # TODO: Index documents into Elasticsearch
-    if not docs:
-        print("No documents to index.")
-        return
-    actions = [
-        {
+def get_bulk_actions(index_name: str, processed_chunks: List[Dict[str, Any]]) -> Generator:
+    for chunk in processed_chunks:
+        yield {
             "_index": index_name,
-            "_source": d  
+            "_source": chunk
         }
-        for d in docs
-    ]
-    helpers.bulk(es, actions)
-    return
+def process_and_index_all(es: Elasticsearch, index_name: str, documents: List[Dict[str, Any]]) -> None:
+    all_processed_chunks = []
+    text_to_embed = []
+    print("Processing documents")
+    for doc in documents:
+        doc_id = doc.get("id")
+        description = doc.get("description", "")
+        if not doc_id or not description:
+            continue
+        clean_description = re.sub(r'[^\x00-\x7F]+', ' ', description)
+        clean_subjects = [str(s).upper() for s in doc.get("subjects", [])]
+        chunks = split_into_chunks(clean_description)
+        for idx, chunk in enumerate(chunks):
+            all_processed_chunks.append({
+                "doc_id": str(doc_id),
+                "chunk_id": f"{doc_id}-{idx}",
+                "title": doc.get("title", ""),
+                "description": chunk,
+                "subjects": clean_subjects
+            })
+            text_to_embed.append(chunk)
+    if not text_to_embed:
+        print("No valid documents to process.")
+        return
+    print("Generating embeddings")
+    embeddings = model.encode(text_to_embed, batch_size=BATCH_SIZE)
+    final_docs = []
+    for meta, embedding in zip(all_processed_chunks, embeddings):
+        meta["embedding"] = embedding.tolist()
+        final_docs.append(meta)
+    for i in range(0, len(final_docs), BATCH_SIZE):
+        batch = final_docs[i:i + BATCH_SIZE]
+        helpers.bulk(es, get_bulk_actions(index_name, batch))
 
 def semantic_search(es: Elasticsearch, index_name: str, query_text: str, k: int = 3) -> Dict[str, Any]:
     # Query to perform semantic search
-    query_vector = generate_embedding(query_text)
+    query_vector = model.encode(query_text).tolist()
 
     body = {
         "knn": {
@@ -140,6 +134,9 @@ def semantic_search(es: Elasticsearch, index_name: str, query_text: str, k: int 
 
 def main() -> None:
     es = Elasticsearch(ELASTICSEARCH_URL)
+    if not es.ping():
+        print(f"Could not connect to Elasticsearch")
+        return
     create_index(es, INDEX_NAME)
     print("Loading documents...")
     documents = load_json_files(INPUT_DIR)
@@ -148,9 +145,7 @@ def main() -> None:
         print("No JSON files found.")
         return
 
-    for document in documents:
-        built_docs = proccess_documents(document)
-        index_documents(es, INDEX_NAME, built_docs)
+    process_and_index_all(es, INDEX_NAME, documents)
 
     print("Semantic search: examples")
 
@@ -159,7 +154,9 @@ def main() -> None:
     queries = [
         "What are the main topics covered in the document?",
         "Summarize the key points of the document.",
-        "What subjects are discussed in the document?"
+        "What subjects are discussed in the document?",
+        "What is the main focus of the document?",
+        "What are the key findings or conclusions of the document?"
     ]
 
     for q in queries:
